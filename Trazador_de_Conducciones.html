@@ -330,6 +330,9 @@ function parseDXF(txt){
     if(ent){if(code===1||code===2)ent.g.push([code,L[i-1]]);else ent.g.push([code,val])}
   }
   flush();
+  return postPts(pts,txts);
+}
+function postPts(pts,txts){
   let out=pts.filter(p=>p.every(isFinite));
   /* puntos sin cota (z=0): asignar la del texto numerico mas cercano (tipico: punto + texto de cota) */
   if(txts.length){
@@ -341,6 +344,44 @@ function parseDXF(txt){
   }
   const nz=out.filter(p=>p[2]!==0).length;if(nz>0.8*out.length)out=out.filter(p=>p[2]!==0);
   return out;
+}
+/* ---------- DWG (libredwg compilado a WebAssembly, se descarga al usarlo) ---------- */
+let _dwgLib=null;
+async function getDwgLib(){
+  if(_dwgLib)return _dwgLib;
+  const base="https://cdn.jsdelivr.net/npm/@mlightcad/libredwg-web@0.8.0";
+  const mod=await import(base+"/dist/libredwg-web.js");
+  _dwgLib=await mod.LibreDwg.create(base+"/wasm");
+  _dwgLib._ft=mod.Dwg_File_Type;
+  return _dwgLib;
+}
+function pointsFromDwgDb(db){
+  const pts=[],txts=[];const P=o=>o&&isFinite(o.x)&&isFinite(o.y)?[o.x,o.y,isFinite(o.z)?o.z:0]:null;
+  const add=o=>{const q=P(o);if(q)pts.push(q)};
+  const num=v=>{const m=String(v==null?"":v).trim().replace(",",".");return /^[-+]?(\d+\.?\d*|\.\d+)(e[-+]?\d+)?$/i.test(m)?parseFloat(m):NaN};
+  for(const e of db.entities||[]){
+    switch(e.type){
+      case "POINT":add(e.position);break;
+      case "INSERT":{const q=P(e.insertionPoint);if(!q)break;
+        for(const a of e.attribs||[]){const v=num(a.text&&a.text.text);if(isFinite(v)&&(/elev|cota|nivel|^z$|^h$/i.test(a.tag||"")||(q[2]===0&&!q.attr))){q[2]=v;q.attr=1}}
+        pts.push(q);break}
+      case "LWPOLYLINE":{const z=isFinite(e.elevation)?e.elevation:0;for(const v of e.vertices||[])if(isFinite(v.x)&&isFinite(v.y))pts.push([v.x,v.y,z]);break}
+      case "POLYLINE2D":case "POLYLINE3D":case "POLYLINE":{const z=isFinite(e.elevation)?e.elevation:0;for(const v of e.vertices||[])if(isFinite(v.x)&&isFinite(v.y))pts.push([v.x,v.y,isFinite(v.z)&&v.z!==0?v.z:z]);break}
+      case "LINE":add(e.startPoint);add(e.endPoint);break;
+      case "3DFACE":add(e.corner1);add(e.corner2);add(e.corner3);add(e.corner4);break;
+      case "TEXT":{const v=num(e.text),sp=e.startPoint;if(isFinite(v)&&sp&&isFinite(sp.x))txts.push([sp.x,sp.y,v,e.textHeight||1]);break}
+      case "MTEXT":{const v=num(String(e.text||"").replace(/^\\[^;]*;/,"").replace(/[{}]/g,"")),ip=e.insertionPoint;if(isFinite(v)&&ip&&isFinite(ip.x))txts.push([ip.x,ip.y,v,e.textHeight||1]);break}
+    }
+  }
+  return postPts(pts,txts);
+}
+async function parseDWG(buf){
+  const lib=await getDwgLib();
+  const dwg=lib.dwg_read_data(buf,lib._ft.DWG);
+  if(dwg==null)throw new Error("la versión de este DWG no es compatible (guárdelo como DXF).");
+  const db=lib.convert(dwg);
+  try{lib.dwg_free(dwg)}catch(_){}
+  return pointsFromDwgDb(db);
 }
 function buildTerrain(raw,label){
   const seen=new Map();for(const p of raw){const k=Math.round(p[0]*20)+","+Math.round(p[1]*20);if(!seen.has(k))seen.set(k,p)}
@@ -652,17 +693,24 @@ $("btnFit").addEventListener("click",fitView);
 $("btnSample").addEventListener("click",sampleTerrain);
 document.querySelectorAll(".tabs button").forEach(b=>b.addEventListener("click",()=>{document.querySelectorAll(".tabs button").forEach(x=>x.classList.toggle("on",x===b));document.querySelectorAll(".tabpane").forEach(p=>p.hidden=p.id!==b.dataset.tab)}));
 let lastFile=null;
-const DWG_MSG="Los .DWG son binarios y el navegador no los puede leer. En AutoCAD/Civil 3D use GUARDAR COMO → DXF (versión 2000 o 2007, ASCII) y cargue ese .dxf. Si la topografía son puntos COGO, también puede exportarlos a CSV (comando EXPORTCIVILPOINTS / PUNTOS → Exportar) en formato PNEZD.";
+const DWG_MSG="Alternativa: en AutoCAD/Civil 3D use GUARDAR COMO → DXF (versión 2000 o 2007, ASCII) y cargue ese .dxf. Si la topografía son puntos COGO, también puede exportarlos a CSV (comando EXPORTCIVILPOINTS / PUNTOS → Exportar) en formato PNEZD.";
+function finishLoad(pts,lab,f){
+  if(pts.length<3){status("No encontré puntos con cota en "+f.name+(/\.dxf$/i.test(f.name)?". El DXF debe tener entidades POINT, INSERT (bloques de punto), POLYLINE/LWPOLYLINE con cota, 3DFACE o textos de cota. Si los puntos son objetos de Civil 3D, use EXPLOTAR/EXPORTAR a CSV (PNEZD).":". Revise el orden de columnas."),true);return}
+  const keep=S.pis.length&&!S.sample;buildTerrain(pts,lab);if(!keep){S.pis=[];S.force.clear()}S.sample=false;fitView();recompute()}
 function loadFile(f){lastFile=f;
-  if(/\.dwg$/i.test(f.name)){status(DWG_MSG,true);return}
+  if(/\.dwg$/i.test(f.name)){
+    status("Leyendo DWG… (la primera vez descarga el lector, ~10 MB)");
+    const rb=new FileReader();rb.onload=async()=>{let pts;
+      try{pts=await parseDWG(rb.result)}catch(err){status("No pude leer el DWG ("+(err&&err.message||err)+"). "+DWG_MSG,true);return}
+      finishLoad(pts,f.name+" (DWG)",f)};
+    rb.readAsArrayBuffer(f);return}
   const rd=new FileReader();rd.onload=()=>{const txt=rd.result;let pts,lab=f.name;
   try{
     if(/^AC10\d\d/.test(txt.slice(0,6))){status(DWG_MSG,true);return}
     if(/^AutoCAD Binary DXF/.test(txt.slice(0,22))){status("Este DXF es binario. Guárdelo como DXF ASCII (en AutoCAD: GUARDAR COMO → DXF, versión 2000/2007; no marque “binario”).",true);return}
     if(/\.dxf$/i.test(f.name)||/^\s*0\s*\r?\n\s*SECTION/.test(txt.slice(0,200))){pts=parseDXF(txt);lab+=" (DXF)"}else{const r=parseText(txt,$("fmt").value);pts=r.pts;lab+=" ("+r.fmt+")"}
   }catch(err){status("No se pudo leer el archivo: "+err.message,true);return}
-  if(pts.length<3){status("No encontré puntos con cota en "+f.name+(/\.dxf$/i.test(f.name)?". El DXF debe tener entidades POINT, INSERT (bloques de punto), POLYLINE/LWPOLYLINE con cota, 3DFACE o textos de cota. Si los puntos son objetos de Civil 3D, use EXPLOTAR/EXPORTAR a CSV (PNEZD).":". Revise el orden de columnas."),true);return}
-  const keep=S.pis.length&&!S.sample;buildTerrain(pts,lab);if(!keep){S.pis=[];S.force.clear()}S.sample=false;fitView();recompute()};rd.readAsText(f)}
+  finishLoad(pts,lab,f)};rd.readAsText(f)}
 $("file").addEventListener("change",e=>{if(e.target.files[0])loadFile(e.target.files[0])});
 $("fmt").addEventListener("change",()=>{if(lastFile)loadFile(lastFile)});
 const dp=$("drop");["dragover","dragenter"].forEach(ev=>dp.addEventListener(ev,e=>{e.preventDefault();dp.classList.add("over")}));["dragleave","drop"].forEach(ev=>dp.addEventListener(ev,()=>dp.classList.remove("over")));
