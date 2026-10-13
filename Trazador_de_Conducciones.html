@@ -276,7 +276,16 @@ function parseText(txt,fmtSel){
   const lines=txt.split(/\r?\n/).filter(l=>l.trim());
   const head=lines.slice(0,20).join("\n");
   const cnt=c=>(head.match(new RegExp(c==="\t"?"\\t":"\\"+c,"g"))||[]).length;
-  let delim=null;if(cnt(";")>=lines.slice(0,20).length)delim=";";else if(cnt("\t")>=lines.slice(0,20).length)delim="\t";else if(cnt(",")>=lines.slice(0,20).length)delim=",";
+  let delim=null;{const n20=lines.slice(0,20).length;let best=0;for(const c of[";","\t",","]){const k=cnt(c);if(k>=n20&&k>best){best=k;delim=c}}}
+  /* Encabezado con nombres de columna (Norte/Este/Elevación…): se usa por nombre, aceptando sufijos N/E/S/W */
+  const hd=lines[0].replace(/^\uFEFF/,"").split(delim||/\s+/).map(s=>s.trim().toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g,""));
+  const ix=re=>hd.findIndex(h=>re.test(h));
+  const cN=ix(/^(norte|north|northing|n|y)$/),cE=ix(/^(este|east|easting|e|x)$/),cZ=ix(/^(elevacion|elevation|elev|cota|altura|z|h)$/);
+  if(cN>=0&&cE>=0&&cZ>=0&&hd.some(h=>!/^[-\d.,]+$/.test(h))){
+    const nv=v=>{const m=String(v||"").trim().replace(",",".").match(/^[-+]?(\d+\.?\d*|\.\d+)(?=[NSEW]?$)/i);return m?parseFloat(m[0]):NaN};
+    const pts=[];for(const l of lines.slice(1)){const t=l.split(delim||/\s+/);const y=nv(t[cN]),x=nv(t[cE]),z=nv(t[cZ]);if(isFinite(x)&&isFinite(y)&&isFinite(z))pts.push([x,y,z])}
+    return{pts,fmt:"por encabezado: "+hd[cN]+"/"+hd[cE]+"/"+hd[cZ]};
+  }
   const rows=[];
   for(const l of lines){
     let t=delim?l.split(delim):l.trim().split(/\s+/);
